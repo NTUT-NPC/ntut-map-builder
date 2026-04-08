@@ -1,0 +1,27 @@
+{
+  "basemap": "campus_basemap.webp",
+  "floors": {
+    "B5": "campus_floor_B5.webp",
+    "B4": "campus_floor_B4.webp",
+    "B3": "campus_floor_B3.webp",
+    "B2": "campus_floor_B2.webp",
+    "B1": "campus_floor_B1.webp",
+    "1F": "campus_floor_1F.webp",
+    "2F": "campus_floor_2F.webp",
+    "3F": "campus_floor_3F.webp",
+    "4F": "campus_floor_4F.webp",
+    "5F": "campus_floor_5F.webp",
+    "6F": "campus_floor_6F.webp",
+    "7F": "campus_floor_7F.webp",
+    "8F": "campus_floor_8F.webp",
+    "9F": "campus_floor_9F.webp",
+    "10F": "campus_floor_10F.webp",
+    "11F": "campus_floor_11F.webp",
+    "12F": "campus_floor_12F.webp",
+    "13F": "campus_floor_13F.webp",
+    "14F": "campus_floor_14F.webp",
+    "15F": "campus_floor_15F.webp",
+    "16F": "campus_floor_16F.webp",
+    "RF": "campus_floor_RF.webp"
+  }
+}
