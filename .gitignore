@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output artifacts and tile cache
+output/
+.tile_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Logs and databases
+*.log
+*.sqlite

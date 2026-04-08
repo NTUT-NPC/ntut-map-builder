@@ -1,0 +1,34 @@
+name: Generate and Upload Maps
+
+on:
+  workflow_dispatch: # 允許手動觸發
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests Pillow
+
+      - name: Generate all maps
+        run: python render_campus.py --clean
+
+      - name: Upload maps to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL_S3: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          # 使用 sync 將整個 output 資料夾同步到 R2 Bucket 的根目錄或指定目錄下
+          # 如果你要放在特定資料夾，例如 maps 裡面，可以改成 s3://${R2_BUCKET_NAME}/maps/
+          aws s3 sync output/ s3://${R2_BUCKET_NAME}/ --acl public-read
