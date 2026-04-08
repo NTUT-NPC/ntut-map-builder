@@ -6,9 +6,8 @@ on:
       - main
       - master
     paths:
-      - 'output/**'  # 只要 output 資料夾內容有改變並 Push 就會自動觸發
-  workflow_dispatch: # 也允許手動觸發
-
+      - 'output/**'
+  workflow_dispatch:
 jobs:
   upload:
     runs-on: ubuntu-latest
@@ -21,8 +20,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL_S3: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          # 單純把專案中的 output 目錄下的靜態檔案同步上去，不再交給伺服器爬圖
-          aws s3 sync output/ s3://${R2_BUCKET_NAME}/ --acl public-read
+          aws s3 sync output/ s3://${{ secrets.R2_BUCKET_NAME }}/ \
+            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} \
+            --acl public-read
