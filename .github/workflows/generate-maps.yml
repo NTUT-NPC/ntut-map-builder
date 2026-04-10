@@ -23,6 +23,7 @@ jobs:
           AWS_ENDPOINT_URL_S3: ${{ secrets.R2_ENDPOINT_URL }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          aws s3 cp output/ s3://${R2_BUCKET_NAME}/ \
+          cd output
+          aws s3 cp . s3://${R2_BUCKET_NAME}/ \
             --recursive \
             --acl public-read

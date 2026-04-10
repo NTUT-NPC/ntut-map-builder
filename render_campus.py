@@ -19,6 +19,8 @@ Requirements: pip install requests Pillow
 import re
 import sys
 import math
+import json
+import html
 import urllib.parse
 from collections import defaultdict
 from io import BytesIO
@@ -26,7 +28,7 @@ from pathlib import Path
 
 try:
     import requests
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
     import urllib3
 except ImportError:
     sys.exit("Please install dependencies:  pip install requests Pillow")
@@ -34,12 +36,13 @@ except ImportError:
 # The GeoServer uses a self-signed / internal CA cert — suppress noisy warnings.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ──────────────────────────── WMS configuration ──────────────────────────────
+# ──────────────────────────── WFS configuration ──────────────────────────────
 
-WMS_BASE    = "https://geoserver.oga.ntut.edu.tw/wms"
-WMS_VERSION = "1.1.1"
+WFS_BASE    = "https://geoserver.oga.ntut.edu.tw/ows"
+WFS_VERSION = "2.0.0"
 CRS         = "EPSG:3826"
-IMAGE_FORMAT = "image/png8"
+# Requesting WFS features directly in Web Mercator for easy basemap alignment
+WFS_SRS     = "EPSG:3857"
 
 # Campus bounding box in EPSG:3826 (from gis:gis_base + gis:gis_base_en)
 CAMPUS_BBOX = {
@@ -51,8 +54,16 @@ CAMPUS_BBOX = {
 
 PADDING_RATIO    = 0.05   # 5 % margin so edge labels are not clipped
 TARGET_LONG_EDGE = 16000  # target 8K pixels on the longer axis
-MAX_TILE_SIZE    = 4096  # GeoServer tile limit per request
-RENDER_DPI       = 120   # GeoServer DPI hint → balance text size to prevent collision/hiding
+MAX_FEATURES     = 10000  # GeoServer count limit per request
+# Font settings for local labels
+LABEL_FONT_SIZE  = 24
+FONT_PATH        = "/usr/share/fonts/google-noto-sans-tc-fonts/NotoSansTC-Regular.otf"
+
+# Feature filtering: exclude rooms containing these keywords in room_name, use, or keyword fields.
+EXCLUDE_KEYWORDS = [
+    "柱子", "走廊", "走道", "梯廳", "管道間", "未命名", "委外空間",
+    "排煙", "機房", "採光", "消防", "茶水間", "電氣室", "大廳", "挑空", "管道"
+]
 
 # Base WMS layers (always included, bottom → top)
 BASE_LAYERS = [
@@ -220,7 +231,7 @@ def fetch_basemap(wgs84: dict, merc: dict, canvas_w: int, canvas_h: int,
     return out
 
 
-# ──────────────────────────── WMS helpers ────────────────────────────────────
+# ──────────────────────────── WFS helpers ────────────────────────────────────
 
 def padded_bbox(bbox: dict, ratio: float) -> dict:
     w = bbox["maxx"] - bbox["minx"]
@@ -245,34 +256,12 @@ def bbox_str(bbox: dict) -> str:
     return f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']}"
 
 
-def build_wms_url(layers: list[str], bbox: dict, width: int, height: int,
-                  transparent: bool = True, crs: str = CRS) -> str:
-    params = {
-        "SERVICE":        "WMS",
-        "VERSION":        WMS_VERSION,
-        "REQUEST":        "GetMap",
-        "LAYERS":         ",".join(layers),
-        "STYLES":         ",".join([""] * len(layers)),
-        "SRS":            crs,
-        "BBOX":           bbox_str(bbox),
-        "WIDTH":          str(width),
-        "HEIGHT":         str(height),
-        "FORMAT":         IMAGE_FORMAT,
-        "TRANSPARENT":    "true" if transparent else "false",
-        "FORMAT_OPTIONS": f"dpi:{RENDER_DPI}",
-    }
-    return WMS_BASE + "?" + urllib.parse.urlencode(params)
-
-
-def fetch_image(url: str, retries: int = 3) -> Image.Image:
+def fetch_json(url: str, retries: int = 3) -> dict:
     for attempt in range(retries):
         try:
             resp = requests.get(url, timeout=120, verify=False)
             resp.raise_for_status()
-            ct = resp.headers.get("Content-Type", "")
-            if "image" not in ct:
-                raise ValueError(f"Non-image response ({ct}): {resp.text[:200]}")
-            return Image.open(BytesIO(resp.content)).convert("RGBA")
+            return resp.json()
         except Exception as exc:
             print(f"  Attempt {attempt+1} failed: {exc}", file=sys.stderr)
             if attempt == retries - 1:
@@ -280,45 +269,122 @@ def fetch_image(url: str, retries: int = 3) -> Image.Image:
     raise RuntimeError("All retries exhausted")
 
 
-def render_wms(layers: list[str], bbox: dict, width: int, height: int,
-               crs: str = CRS) -> Image.Image:
-    """Fetch WMS, tiling into sub-requests if needed (GeoServer ≤ MAX_TILE_SIZE px)."""
-    if width <= MAX_TILE_SIZE and height <= MAX_TILE_SIZE:
-        url = build_wms_url(layers, bbox, width, height, crs=crs)
-        print(f"    GET {width}×{height} …", end=" ", flush=True)
-        img = fetch_image(url)
-        print("✓")
-        return img
+def render_svg(layers: list[str], bbox: dict, width: int, height: int,
+               basemap_url: str = None) -> str:
+    """Fetch WFS features and generate a standalone SVG string."""
+    svg_header = (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        'xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">\n'
+    )
+    svg_footer = '</svg>'
+    
+    # CSS for styling (Modern, Non-Grayscale Palette)
+    style = """
+    <style>
+        .building { fill: #f0f4f8; stroke: #d1dce5; stroke-width: 2; }
+        .room     { fill: #ffffff; fill-opacity: 0.8; stroke: #bcccdc; stroke-width: 1; }
+        .label    { font-family: "Noto Sans TC", sans-serif; font-size: 24px; fill: #334e68; font-weight: 500; text-anchor: middle; dominant-baseline: middle; }
+    </style>
+    """
+    
+    body = [svg_header, style]
+    
+    # Basemap embedding disabled
+    # if basemap_url:
+    #     body.append(f'  <image xlink:href="{basemap_url}" width="{width}" height="{height}" />\n')
 
-    cols = math.ceil(width  / MAX_TILE_SIZE)
-    rows = math.ceil(height / MAX_TILE_SIZE)
-    canvas = Image.new("RGBA", (width, height), (255, 255, 255, 0))
-    bx_span = bbox["maxx"] - bbox["minx"]
-    by_span = bbox["maxy"] - bbox["miny"]
+    # Scaling helpers
+    bx_min, bx_max = bbox["minx"], bbox["maxx"]
+    by_min, by_max = bbox["miny"], bbox["maxy"]
+    bx_span = bx_max - bx_min
+    by_span = by_max - by_min
 
-    for row in range(rows):
-        for col in range(cols):
-            px0 = col * MAX_TILE_SIZE
-            px1 = min(px0 + MAX_TILE_SIZE, width)
-            py0 = row * MAX_TILE_SIZE
-            py1 = min(py0 + MAX_TILE_SIZE, height)
-            tw, th = px1 - px0, py1 - py0
-            f_x0 = px0 / width
-            f_x1 = px1 / width
-            f_y1 = 1.0 - (py0 / height)
-            f_y0 = 1.0 - (py1 / height)
-            sub_bbox = {
-                "minx": bbox["minx"] + f_x0 * bx_span,
-                "maxx": bbox["minx"] + f_x1 * bx_span,
-                "miny": bbox["miny"] + f_y0 * by_span,
-                "maxy": bbox["miny"] + f_y1 * by_span,
-            }
-            url = build_wms_url(layers, sub_bbox, tw, th, crs=crs)
-            print(f"    tile [{row},{col}] {tw}×{th} …", end=" ", flush=True)
-            canvas.paste(fetch_image(url), (px0, py0))
-            print("✓")
+    def to_px(x, y):
+        px = (x - bx_min) / bx_span * width
+        py = (1.0 - (y - by_min) / by_span) * height
+        return f"{px:.2f},{py:.2f}"
 
-    return canvas
+    placed_labels = [] # List of (x0, y0, x1, y1)
+
+    for layer in layers:
+        layer_id = layer.replace(":", "_")
+        body.append(f'  <g id="{layer_id}">\n')
+        
+        params = {
+            "service": "WFS",
+            "version": WFS_VERSION,
+            "request": "GetFeature",
+            "typeNames": layer,
+            "outputFormat": "application/json",
+            "SRSNAME": WFS_SRS,
+            "count": MAX_FEATURES,
+        }
+        url = WFS_BASE + "?" + urllib.parse.urlencode(params)
+        print(f"    Fetching {layer} …", end=" ", flush=True)
+        data = fetch_json(url)
+        features = data.get("features", [])
+        print(f"({len(features)} features) ✓")
+
+        is_building = "building" in layer
+        css_class = "building" if is_building else "room"
+
+        for feat in features:
+            props = feat.get("properties", {})
+            
+            # Filtering for room layers
+            if not is_building:
+                name    = props.get("room_name") or ""
+                usage   = props.get("use") or ""
+                keyword = props.get("keyword") or ""
+                
+                if any(k in (name + usage + keyword) for k in EXCLUDE_KEYWORDS):
+                    continue
+
+            geom = feat.get("geometry")
+            if not geom: continue
+            
+            polys = []
+            if geom["type"] == "Polygon":
+                polys = [geom["coordinates"]]
+            elif geom["type"] == "MultiPolygon":
+                polys = geom["coordinates"]
+            
+            for poly in polys:
+                # Build SVG path data
+                d = []
+                for ring in poly:
+                    pts = [to_px(c[0], c[1]) for c in ring]
+                    if not pts: continue
+                    d.append(f"M {pts[0]} " + " ".join(f"L {p}" for p in pts[1:]) + " Z")
+                
+                path_data = " ".join(d)
+                body.append(f'    <path class="{css_class}" d="{path_data}" />\n')
+
+            # Raw Labels: no calculations, no wrapping, no truncation, no collision check.
+            if not is_building:
+                rid   = props.get("room_id") or props.get("id") or ""
+                rname = props.get("room_name") or ""
+                
+                display_name = (rname or rid).strip()
+                
+                if display_name:
+                    f_bbox = feat.get("bbox")
+                    if f_bbox:
+                        cx, cy = (f_bbox[0]+f_bbox[2])/2, (f_bbox[1]+f_bbox[3])/2
+                    else:
+                        first_ring = polys[0][0]
+                        cx = sum(c[0] for c in first_ring) / len(first_ring)
+                        cy = sum(c[1] for c in first_ring) / len(first_ring)
+                    
+                    xy = to_px(cx, cy).split(",")
+                    px, py = float(xy[0]), float(xy[1])
+                    
+                    body.append(f'    <text x="{px:.2f}" y="{py:.2f}" class="label">{html.escape(display_name)}</text>\n')
+        
+        body.append('  </g>\n')
+
+    body.append(svg_footer)
+    return "".join(body)
 
 
 # ────────────────────────── layer grouping ───────────────────────────────────
@@ -366,7 +432,7 @@ def load_floor_groups(room_file: Path) -> dict[str, list[str]]:
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Render NTUT campus WMS floor maps")
+    ap = argparse.ArgumentParser(description="Render NTUT campus WFS floor maps")
     ap.add_argument("--clean",   action="store_true",
                     help="Delete existing output PNGs and re-render all")
     ap.add_argument("--basemap", action="store_true",
@@ -375,17 +441,22 @@ def main():
                     help="Render only this floor (e.g. 1F, B1, RF)")
     args = ap.parse_args()
 
-    print("=== NTUT Campus WMS Floor Map Renderer ===")
+    print("=== NTUT Campus WFS Floor Map Renderer ===")
+    print("    Source : GeoServer WFS (JSON API)")
     print("    Basemap: Carto Voyager (OpenStreetMap)")
     print()
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     if args.clean:
-        removed = list(OUTPUT_DIR.glob("campus_*.png")) + list(OUTPUT_DIR.glob("campus_*.webp"))
+        # Clean floor-specific output but preserve global basemap and caches
+        patterns = ["campus_floor_*.svg", "campus_floor_*.webp", "campus_floor_*.png"]
+        removed = []
+        for p in patterns:
+            removed.extend(list(OUTPUT_DIR.glob(p)))
         for f in removed:
             f.unlink()
-        print(f"Cleaned {len(removed)} existing maps.\n")
+        print(f"Cleaned {len(removed)} existing floor maps.\n")
 
     # Native EPSG:3826 bounds of campus
     bbox_3826 = padded_bbox(CAMPUS_BBOX, PADDING_RATIO)
@@ -396,18 +467,16 @@ def main():
     wms_crs   = "EPSG:3857"
 
     canvas_w, canvas_h = compute_canvas_size(wms_bbox, TARGET_LONG_EDGE)
-    print(f"Canvas size : {canvas_w} × {canvas_h} px  (DPI hint: {RENDER_DPI})")
-    print(f"WMS bbox    : {bbox_str(wms_bbox)}")
-    print(f"Tiling      : {math.ceil(canvas_w/MAX_TILE_SIZE)}×{math.ceil(canvas_h/MAX_TILE_SIZE)} per request")
+    print(f"Canvas size : {canvas_w} × {canvas_h} px")
+    print(f"WFS bbox    : {bbox_str(wms_bbox)}")
     print()
 
-    # Pre-fetch and save basemap once
-    basemap_img = fetch_basemap(wgs84_bbox, merc_bbox, canvas_w, canvas_h)
-    basemap_path = OUTPUT_DIR / "campus_basemap.webp"
-    if not basemap_path.exists() or args.clean:
-        basemap_img.save(str(basemap_path), format="WEBP", lossless=False, quality=85, method=6)
-        print(f"  → Saved {basemap_path.name}  ({basemap_path.stat().st_size // 1024} KB)")
-    print()
+    # Basemap fetching disabled as requested
+    # basemap_img = fetch_basemap(wgs84_bbox, merc_bbox, canvas_w, canvas_h)
+    # basemap_path = OUTPUT_DIR / "campus_basemap.webp"
+    # if not basemap_path.exists() or args.clean:
+    #     basemap_img.save(str(basemap_path), format="WEBP", lossless=False, quality=85, method=6)
+    #     print(f"  → Saved {basemap_path.name}  ({basemap_path.stat().st_size // 1024} KB)")
 
     floor_groups = load_floor_groups(ROOM_LIST_FILE)
     print(f"Floors found: {len(floor_groups)}")
@@ -419,20 +488,16 @@ def main():
         if args.floor and floor != args.floor:
             continue
 
-        out_path = OUTPUT_DIR / f"campus_floor_{floor}.webp"
-        if out_path.exists():
+        out_path = OUTPUT_DIR / f"campus_floor_{floor}.svg"
+        if out_path.exists() and not args.clean:
             print(f"[{floor}] Already exists, skipping → {out_path.name}")
             continue
 
-        print(f"[{floor}] Rendering {len(room_layers)} room layers …")
-        wms_img = render_wms(BASE_LAYERS + room_layers, wms_bbox, canvas_w, canvas_h,
-                             crs=wms_crs)
+        print(f"[{floor}] Generating SVG floor map …")
+        svg_content = render_svg(BASE_LAYERS + room_layers, wms_bbox, canvas_w, canvas_h)
 
-        # Convert to Grayscale + Alpha to aggressively reduce color space
-        wms_img = wms_img.convert("LA")
-
-        # Save as WEBP for much better compression
-        wms_img.save(str(out_path), format="WEBP", lossless=True, method=6)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(svg_content)
         print(f"  → Saved {out_path.name}  ({out_path.stat().st_size // 1024} KB)\n")
 
     import json
@@ -441,7 +506,7 @@ def main():
         "floors": {}
     }
     for floor in floor_groups.keys():
-        manifest["floors"][floor] = f"campus_floor_{floor}.webp"
+        manifest["floors"][floor] = f"campus_floor_{floor}.svg"
         
     manifest_path = OUTPUT_DIR / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
